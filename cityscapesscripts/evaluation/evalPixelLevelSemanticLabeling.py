@@ -29,6 +29,10 @@ import os, sys
 import platform
 import fnmatch
 
+from multiprocessing import Pool, cpu_count
+import signal
+
+
 try:
     from itertools import izip
 except ImportError:
@@ -181,7 +185,7 @@ def generateMatrix(args):
     # We use longlong type to be sure that there are no overflows
     return np.zeros(shape=(maxId+1, maxId+1),dtype=np.ulonglong)
 
-def generateInstanceStats(args):
+def generateInstanceStats():
     instanceStats = {}
     instanceStats["classes"   ] = {}
     instanceStats["categories"] = {}
@@ -456,32 +460,64 @@ def printCategoryScores(scoreDict, instScoreDict, args):
         niouStr = getColorEntry(instScoreDict[categoryName], args) + "{val:>5.3f}".format(val=instScoreDict[categoryName]) + args.nocol
         print("{:<14}: ".format(categoryName) + iouStr + "    " + niouStr)
 
+
+
 # Evaluate image lists pairwise.
 def evaluateImgLists(predictionImgList, groundTruthImgList, args):
     if len(predictionImgList) != len(groundTruthImgList):
         printError("List of images for prediction and groundtruth are not of equal size.")
-    confMatrix    = generateMatrix(args)
-    instStats     = generateInstanceStats(args)
-    perImageStats = {}
-    nbPixels      = 0
 
     if not args.quiet:
         print("Evaluating {} pairs of images...".format(len(predictionImgList)))
 
-    # Evaluate all pairs of images and save them into a matrix
-    for i in range(len(predictionImgList)):
-        predictionImgFileName = predictionImgList[i]
-        groundTruthImgFileName = groundTruthImgList[i]
-        #print "Evaluate ", predictionImgFileName, "<>", groundTruthImgFileName
-        nbPixels += evaluatePair(predictionImgFileName, groundTruthImgFileName, confMatrix, instStats, perImageStats, args)
+    confMatrix    = generateMatrix(args)
+    instStats     = generateInstanceStats()
+    perImageStats = {}
+    nbPixels      = 0
 
-        # sanity check
-        if confMatrix.sum() != nbPixels:
-            printError('Number of analyzed pixels and entries in confusion matrix disagree: contMatrix {}, pixels {}'.format(confMatrix.sum(),nbPixels))
+    def worker_init():
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-        if not args.quiet:
-            print("\rImages Processed: {}".format(i+1), end=' ')
-            sys.stdout.flush()
+    parallelism = cpu_count()
+    num_images = len(predictionImgList)
+    chunksize = int(math.ceil(num_images / parallelism))
+    pool = Pool(processes=parallelism, initializer=worker_init)
+    tasks = [pool.apply_async(
+        eval_image_list,
+        args=(
+            predictionImgList[i: min(num_images, i+chunksize)],
+            groundTruthImgList[i: min(num_images, i+chunksize)],
+            confMatrix.shape
+        ),
+        kwds={'worker_num': worker_num, 'worker_index': i}) for worker_num, i in enumerate(range(0, num_images, chunksize))]
+    results_list = [task.get() for task in tasks]
+
+    for results in results_list:
+        nbPixels += results['nb_pixels']
+
+        # accumulate conf_matrix
+        confMatrix += results['conf_matrix']
+
+        # accumulate instance stats
+        for class_label, d in results['instance_stats']['classes'].items():
+            root_d = instStats['classes'][class_label]
+            root_d['tp'] += d['tp']
+            root_d['tpWeighted'] += d['tpWeighted']
+            root_d['fn'] += d['fn']
+            root_d['fnWeighted'] += d['fnWeighted']
+        for category, d in results['instance_stats']['categories'].items():
+            root_d = instStats['categories'][category]
+            root_d['tp'] += d['tp']
+            root_d['tpWeighted'] += d['tpWeighted']
+            root_d['fn'] += d['fn']
+            root_d['fnWeighted'] += d['fnWeighted']
+
+        # accumulate per image stats
+        for pred_path, d in results['per_image_stats'].items():
+            root_d = perImageStats[pred_path]
+            root_d['nbNotIgnoredPixels'] = root_d.get('nbNotIgnoredPixels', 0) + d['nbNotIgnoredPixels']
+            root_d['nbCorrectPixels'] = root_d.get('nbCorrectPixels', 0) + d['nbCorrectPixels']
+
     if not args.quiet:
         print("\n")
 
@@ -545,104 +581,165 @@ def evaluateImgLists(predictionImgList, groundTruthImgList, args):
     # return confusion matrix
     return allResultsDict
 
+def eval_image_list(pred_images, ground_truth_images, conf_matrix_shape, worker_num=0, worker_index=0):
+    conf_matrix = np.zeros(conf_matrix_shape, dtype=np.ulonglong)
+    instance_stats = generateInstanceStats()
+    per_image_stats = {}
+    nb_pixels = 0
+
+    # Evaluate all pairs of images and save them into a matrix
+    num_images = len(pred_images)
+    for i in range(num_images):
+        print("worker[{}] evaluating {} out of {} at index {}".format(worker_num, i, num_images, worker_index + i))
+        sys.stdout.flush()
+        predictionImgFileName = pred_images[i]
+        groundTruthImgFileName = ground_truth_images[i]
+        #print "Evaluate ", predictionImgFileName, "<>", groundTruthImgFileName
+        results = evaluate_pair(predictionImgFileName, groundTruthImgFileName,
+                               conf_matrix_shape = conf_matrix.shape,
+                               evalLabels=args.evalLabels,
+                               avgClassSize=args.avgClassSize,
+                               evalInstLevelScore=args.evalInstLevelScore,
+                               evalPixelAccuracy=args.evalPixelAccuracy)
+        nb_pixels += results['nb_pixels']
+
+        # accumulate conf_matrix
+        conf_matrix += results['conf_matrix']
+
+        # accumulate instance stats
+        for class_label, d in results['instance_stats']['classes'].items():
+            root_d = instance_stats['classes'][class_label]
+            root_d['tp'] += d['tp']
+            root_d['tpWeighted'] += d['tpWeighted']
+            root_d['fn'] += d['fn']
+            root_d['fnWeighted'] += d['fnWeighted']
+        for category, d in results['instance_stats']['categories'].items():
+            root_d = instance_stats['categories'][category]
+            root_d['tp'] += d['tp']
+            root_d['tpWeighted'] += d['tpWeighted']
+            root_d['fn'] += d['fn']
+            root_d['fnWeighted'] += d['fnWeighted']
+
+        # accumulate per image stats
+        for pred_path, d in results['per_image_stats'].items():
+            root_d = per_image_stats[pred_path]
+            root_d['nbNotIgnoredPixels'] = root_d.get('nbNotIgnoredPixels', 0) + d['nbNotIgnoredPixels']
+            root_d['nbCorrectPixels'] = root_d.get('nbCorrectPixels', 0) + d['nbCorrectPixels']
+
+    return {
+        'nb_pixels': nb_pixels,
+        'conf_matrix': conf_matrix,
+        'instance_stats': instance_stats,
+        'per_image_stats': per_image_stats,
+    }
+
+
 # Main evaluation method. Evaluates pairs of prediction and ground truth
 # images which are passed as arguments.
-def evaluatePair(predictionImgFileName, groundTruthImgFileName, confMatrix, instanceStats, perImageStats, args):
+def evaluate_pair(prediction_path, ground_truth_path,
+                  conf_matrix_shape,
+                  evalLabels, avgClassSize, evalInstLevelScore, evalPixelAccuracy):
     # Loading all resources for evaluation.
     try:
-        predictionImg = Image.open(predictionImgFileName)
-        predictionNp  = np.array(predictionImg)
+        prediction_image = Image.open(prediction_path)
+        prediction_np = np.array(prediction_image)
     except:
-        printError("Unable to load " + predictionImgFileName)
+        printError("Unable to load " + prediction_path)
     try:
-        groundTruthImg = Image.open(groundTruthImgFileName)
-        groundTruthNp = np.array(groundTruthImg)
+        ground_truth_img = Image.open(ground_truth_path)
+        ground_truth_np = np.array(ground_truth_img)
     except:
-        printError("Unable to load " + groundTruthImgFileName)
+        printError("Unable to load " + ground_truth_path)
     # load ground truth instances, if needed
-    if args.evalInstLevelScore:
-        groundTruthInstanceImgFileName = groundTruthImgFileName.replace("labelIds","instanceIds")
+    if evalInstLevelScore:
+        ground_truth_instance_img_file_name = ground_truth_path.replace("labelIds", "instanceIds")
         try:
-            instanceImg = Image.open(groundTruthInstanceImgFileName)
-            instanceNp  = np.array(instanceImg)
+            instance_img = Image.open(ground_truth_instance_img_file_name)
+            instance_np = np.array(instance_img)
         except:
-            printError("Unable to load " + groundTruthInstanceImgFileName)
+            printError("Unable to load " + ground_truth_instance_img_file_name)
 
     # Check for equal image sizes
-    if (predictionImg.size[0] != groundTruthImg.size[0]):
-        printError("Image widths of " + predictionImgFileName + " and " + groundTruthImgFileName + " are not equal.")
-    if (predictionImg.size[1] != groundTruthImg.size[1]):
-        printError("Image heights of " + predictionImgFileName + " and " + groundTruthImgFileName + " are not equal.")
-    if ( len(predictionNp.shape) != 2 ):
+    if prediction_image.size[0] != ground_truth_img.size[0]:
+        printError("Image widths of " + prediction_path + " and " + ground_truth_path + " are not equal.")
+    if prediction_image.size[1] != ground_truth_img.size[1]:
+        printError("Image heights of " + prediction_path + " and " + ground_truth_path + " are not equal.")
+    if len(prediction_np.shape) != 2:
         printError("Predicted image has multiple channels.")
 
-    imgWidth  = predictionImg.size[0]
-    imgHeight = predictionImg.size[1]
-    nbPixels  = imgWidth*imgHeight
+    img_width = prediction_image.size[0]
+    img_height = prediction_image.size[1]
+    nb_pixels = img_width * img_height
 
-    # Evaluate images
-    if (CSUPPORT):
-        # using cython
-        confMatrix = addToConfusionMatrix.cEvaluatePair(predictionNp, groundTruthNp, confMatrix, args.evalLabels)
-    else:
-        # the slower python way
-        for (groundTruthImgPixel,predictionImgPixel) in izip(groundTruthImg.getdata(),predictionImg.getdata()):
-            if (not groundTruthImgPixel in args.evalLabels):
-                printError("Unknown label with id {:}".format(groundTruthImgPixel))
+    conf_matrix = np.zeros(conf_matrix_shape, dtype=np.ulonglong)
+    instance_stats = generateInstanceStats()
+    per_image_stats = {}
 
-            confMatrix[groundTruthImgPixel][predictionImgPixel] += 1
+    # the slower python way
+    for (ground_truth_img_pixel, prediction_img_pixel) in izip(ground_truth_img.getdata(), prediction_image.getdata()):
+        if (not ground_truth_img_pixel in evalLabels):
+            printError("Unknown label with id {:}".format(ground_truth_img_pixel))
 
-    if args.evalInstLevelScore:
+        conf_matrix[ground_truth_img_pixel][prediction_img_pixel] += 1
+
+    if evalInstLevelScore:
         # Generate category masks
-        categoryMasks = {}
-        for category in instanceStats["categories"]:
-            categoryMasks[category] = np.in1d( predictionNp , instanceStats["categories"][category]["labelIds"] ).reshape(predictionNp.shape)
+        category_masks = {}
+        for category in instance_stats["categories"]:
+            category_masks[category] = np.in1d(
+                prediction_np,
+                instance_stats["categories"][category]["labelIds"]).reshape(
+                prediction_np.shape)
 
-        instList = np.unique(instanceNp[instanceNp > 1000])
-        for instId in instList:
-            labelId = int(instId/1000)
-            label = id2label[ labelId ]
+        inst_list = np.unique(instance_np[instance_np > 1000])
+        for instId in inst_list:
+            label_id = int(instId / 1000)
+            label = id2label[label_id]
             if label.ignoreInEval:
                 continue
 
-            mask = instanceNp==instId
-            instSize = np.count_nonzero( mask )
+            mask = instance_np == instId
+            inst_size = np.count_nonzero(mask)
 
-            tp = np.count_nonzero( predictionNp[mask] == labelId )
-            fn = instSize - tp
+            tp = np.count_nonzero(prediction_np[mask] == label_id)
+            fn = inst_size - tp
 
-            weight = args.avgClassSize[label.name] / float(instSize)
-            tpWeighted = float(tp) * weight
-            fnWeighted = float(fn) * weight
+            weight = avgClassSize[label.name] / float(inst_size)
+            tp_weighted = float(tp) * weight
+            fn_weighted = float(fn) * weight
 
-            instanceStats["classes"][label.name]["tp"]         += tp
-            instanceStats["classes"][label.name]["fn"]         += fn
-            instanceStats["classes"][label.name]["tpWeighted"] += tpWeighted
-            instanceStats["classes"][label.name]["fnWeighted"] += fnWeighted
+            instance_stats["classes"][label.name]["tp"] += tp
+            instance_stats["classes"][label.name]["fn"] += fn
+            instance_stats["classes"][label.name]["tpWeighted"] += tp_weighted
+            instance_stats["classes"][label.name]["fnWeighted"] += fn_weighted
 
             category = label.category
-            if category in instanceStats["categories"]:
-                catTp = 0
-                catTp = np.count_nonzero( np.logical_and( mask , categoryMasks[category] ) )
-                catFn = instSize - catTp
+            if category in instance_stats["categories"]:
+                cat_tp = np.count_nonzero(np.logical_and(mask, category_masks[category]))
+                cat_fn = inst_size - cat_tp
 
-                catTpWeighted = float(catTp) * weight
-                catFnWeighted = float(catFn) * weight
+                cat_tp_weighted = float(cat_tp) * weight
+                cat_fn_weighted = float(cat_fn) * weight
 
-                instanceStats["categories"][category]["tp"]         += catTp
-                instanceStats["categories"][category]["fn"]         += catFn
-                instanceStats["categories"][category]["tpWeighted"] += catTpWeighted
-                instanceStats["categories"][category]["fnWeighted"] += catFnWeighted
+                instance_stats["categories"][category]["tp"] += cat_tp
+                instance_stats["categories"][category]["fn"] += cat_fn
+                instance_stats["categories"][category]["tpWeighted"] += cat_tp_weighted
+                instance_stats["categories"][category]["fnWeighted"] += cat_fn_weighted
 
-    if args.evalPixelAccuracy:
-        notIgnoredLabels = [l for l in args.evalLabels if not id2label[l].ignoreInEval]
-        notIgnoredPixels = np.in1d( groundTruthNp , notIgnoredLabels , invert=True ).reshape(groundTruthNp.shape)
-        erroneousPixels = np.logical_and( notIgnoredPixels , ( predictionNp != groundTruthNp ) )
-        perImageStats[predictionImgFileName] = {}
-        perImageStats[predictionImgFileName]["nbNotIgnoredPixels"] = np.count_nonzero(notIgnoredPixels)
-        perImageStats[predictionImgFileName]["nbCorrectPixels"]    = np.count_nonzero(erroneousPixels)
+    if evalPixelAccuracy:
+        not_ignored_labels = [l for l in evalLabels if not id2label[l].ignoreInEval]
+        not_ignored_pixels = np.in1d(ground_truth_np, not_ignored_labels, invert=True).reshape(ground_truth_np.shape)
+        erroneous_pixels = np.logical_and(not_ignored_pixels, (prediction_np != ground_truth_np))
+        per_image_stats[prediction_path] = {}
+        per_image_stats[prediction_path]["nbNotIgnoredPixels"] = np.count_nonzero(not_ignored_pixels)
+        per_image_stats[prediction_path]["nbCorrectPixels"] = np.count_nonzero(erroneous_pixels)
 
-    return nbPixels
+    return {
+        'nb_pixels': nb_pixels,
+        'conf_matrix': conf_matrix,
+        'instance_stats': instance_stats,
+        'per_image_stats': per_image_stats,
+    }
 
 # The main method
 def main(argv):
